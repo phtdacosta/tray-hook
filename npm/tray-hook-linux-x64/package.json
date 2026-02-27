@@ -3,6 +3,10 @@
   "version": "1.0.0",
   "description": "tray-hook native binary for Linux x64",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/phtdacosta/tray-hook.git"
+  },
   "os": ["linux"],
   "cpu": ["x64"],
   "bin": {
