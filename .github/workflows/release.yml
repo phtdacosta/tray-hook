@@ -92,7 +92,7 @@ jobs:
         working-directory: npm/${{ matrix.settings.npm_dir }}
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          npm version "$VERSION" --no-git-tag-version
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
 
       # Publish, but treat "already published" as a non-fatal condition so
       # that re-running a partially failed workflow doesn't hard-fail on the
@@ -131,7 +131,7 @@ jobs:
         working-directory: npm/tray-hook
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          npm version "$VERSION" --no-git-tag-version
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
           node -e "
             const fs = require('fs');
             const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
