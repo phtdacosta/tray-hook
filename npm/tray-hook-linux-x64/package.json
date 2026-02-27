@@ -1,0 +1,15 @@
+{
+  "name": "@phtdacosta/tray-hook-linux-x64",
+  "version": "1.0.0",
+  "description": "tray-hook native binary for Linux x64",
+  "license": "MIT",
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "bin": {
+    "tray-hook": "./tray-hook"
+  },
+  "files": [
+    "tray-hook",
+    "package.json"
+  ]
+}
