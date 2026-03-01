@@ -29,16 +29,14 @@ await tray.start();
 await tray.setIcon('./icon.png');
 await tray.setTooltip('My App');
 
-await tray.add('open',  'Open App');
-await tray.add('quit',  'Quit');
+await tray.add('open', 'Open App');
+await tray.add('quit', 'Quit');
 
 tray.on('click', (id) => {
-  if (id === 'open')  openApp();
-  if (id === 'quit')  tray.quit();
+  if (id === 'open') openApp();
+  if (id === 'quit') tray.quit();
 });
 ```
-
-That's it. A tray icon with a menu, driven entirely from JS, with no native build step.
 
 ---
 
@@ -56,7 +54,7 @@ tray-hook daemon (Rust)
 System Tray (Windows/macOS/Linux)
 ```
 
-tray-hook ships a pre-compiled Rust binary for each platform. When you call `tray.start()`, it spawns that binary as a child process. All commands flow as newline-delimited JSON over stdin; all events (clicks, errors, acks) flow back over stdout. The daemon manages the OS event loop and native menu objects so your JS never has to.
+tray-hook ships a pre-compiled Rust binary for each platform. When you call `tray.start()`, it spawns that binary as a child process. All commands flow as newline-delimited JSON over stdin; all events flow back over stdout. The daemon manages the OS event loop and native menu objects so your JS never has to.
 
 **Why Rust?**
 - Native OS tray APIs require a GUI event loop that must own the main thread — impossible in Node/Bun without native addons
@@ -96,15 +94,28 @@ bun add tray-hook
 
 ---
 
+## What's New in v1.1.0
+
+- **Tray icon click events** — detect left, right, and double-clicks directly on the tray icon via the new `tray_click` event
+- **Declarative menus** — `setMenu(template)` replaces the entire menu atomically with no flicker, using a typed template tree
+- **Named icon states** — `defineStates()` / `setState()` for instant, pre-loaded icon switching with no I/O at switch time
+- **Base64 icon support** — `setIconData()` sets the tray icon from a dynamically generated base64 PNG string
+- **Autostart API** — `setAutostart()` / `getAutostart()` for cross-platform system startup registration
+- **Auto-restart with state replay** — the daemon automatically respawns after an unexpected crash and replays the full menu, icon, tooltip, and state — your tray reappears without user intervention
+- **Crash circuit-breaker** — auto-restart is permanently disabled after 5 crashes within 10 seconds to prevent CPU-pegging infinite loops
+
+---
+
 ## API Reference
 
-### `createTray()`
+### `createTray(options?)`
 
-Factory function. Returns a new `Tray` instance. Equivalent to `new Tray()`.
+Factory function. Returns a new `Tray` instance.
 
 ```javascript
 import { createTray } from 'tray-hook';
-const tray = createTray();
+
+const tray = createTray({ autoRestart: true }); // autoRestart defaults to true
 ```
 
 ---
@@ -113,228 +124,29 @@ const tray = createTray();
 
 #### `tray.start() → Promise<void>`
 
-Spawns the Rust daemon and resolves when it's ready to accept commands.
-
-- **Idempotent:** Safe to call multiple times. Concurrent calls all receive the same Promise and share the same startup.
-- **Rejects** if the binary fails to spawn, is not found, or exits before signalling ready.
-- All commands sent before `start()` resolves are queued and flushed automatically.
+Spawns the Rust daemon and resolves when it's ready to accept commands. Idempotent — concurrent calls share the same Promise.
 
 ```javascript
 await tray.start();
-// Daemon is ready — all subsequent commands execute immediately
 ```
-
-> **Always `await` this** before calling any other method. Calling methods before `start()` is safe — they queue — but errors during startup will reject those queued commands.
 
 ---
 
 #### `tray.destroy() → void`
 
-Immediately kills the daemon and rejects all in-flight commands.
-
-- Synchronous. Does not wait for the process to exit.
-- Clears the command queue.
-- Emits `"exit"` once the OS confirms the process is gone.
-- After `destroy()`, you can call `start()` again to restart.
-
-```javascript
-// Force teardown — use for unrecoverable error states
-tray.destroy();
-```
-
-> For graceful shutdown, prefer `tray.quit()` which lets the daemon clean up the tray icon before exiting.
+Immediately kills the daemon and rejects all in-flight commands. For graceful shutdown, prefer `tray.quit()`.
 
 ---
 
-#### `tray.send(cmd) → Promise<void>`
+#### `tray.disableAutoRestart() → void`
 
-Low-level escape hatch. Sends a raw command object to the daemon and returns a Promise that resolves on ack or rejects on error or timeout.
-
-All higher-level methods call this internally. Use it only if you need to send a command not yet covered by the typed API.
-
-```javascript
-await tray.send({ action: 'set_tooltip', title: 'Hello' });
-```
-
-Every command times out after **10 seconds** if no ack is received, rejecting with a descriptive error.
+Permanently disables auto-restart without killing the current daemon.
 
 ---
 
-### Menu Creation
+#### `tray.send(cmd) → Promise<unknown>`
 
-All creation methods share a common rule: **IDs must be unique.** Registering the same ID twice rejects with an error.
-
----
-
-#### `tray.add(id, title, options?) → Promise<void>`
-
-Adds a regular clickable menu item.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | `string` | ✅ | Unique identifier. Used to reference this item in future calls and in click events. |
-| `title` | `string` | ✅ | Label shown in the menu. |
-| `options.enabled` | `boolean` | — | Whether the item is clickable. Default: `true`. |
-| `options.parent_id` | `string` | — | ID of a submenu to nest this item inside. Omit for root level. |
-
-```javascript
-await tray.add('open',  'Open Window');
-await tray.add('about', 'About',  { enabled: false });
-await tray.add('sub-item', 'Sub Item', { parent_id: 'my-submenu' });
-```
-
----
-
-#### `tray.addCheck(id, title, options?) → Promise<void>`
-
-Adds a checkable menu item that toggles a visible checkmark when clicked.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | `string` | ✅ | Unique identifier. |
-| `title` | `string` | ✅ | Label shown in the menu. |
-| `options.checked` | `boolean` | — | Initial checked state. Default: `false`. |
-| `options.enabled` | `boolean` | — | Whether the item is clickable. Default: `true`. |
-| `options.parent_id` | `string` | — | ID of a submenu to nest this item inside. |
-
-```javascript
-await tray.addCheck('dark-mode', 'Dark Mode', { checked: true });
-await tray.addCheck('notifications', 'Enable Notifications');
-```
-
-When clicked, emits a `"check"` event (not `"click"`) with the new boolean state. See [Events](#events).
-
----
-
-#### `tray.addSubmenu(id, title, options?) → Promise<void>`
-
-Adds a submenu — a nested menu that expands on hover. Items are added into it by passing `parent_id` to other add methods.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | `string` | ✅ | Unique identifier. Used as `parent_id` for child items. |
-| `title` | `string` | ✅ | Label shown in the parent menu. |
-| `options.enabled` | `boolean` | — | Whether the submenu is accessible. Default: `true`. |
-| `options.parent_id` | `string` | — | ID of a parent submenu (for nesting submenus). |
-
-```javascript
-await tray.addSubmenu('settings', 'Settings');
-await tray.add('theme',    'Change Theme',    { parent_id: 'settings' });
-await tray.add('language', 'Change Language', { parent_id: 'settings' });
-```
-
-Maximum nesting depth is **5 levels**.
-
----
-
-#### `tray.addSeparator(id, options?) → Promise<void>`
-
-Adds a horizontal visual divider line between menu items.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | `string` | ✅ | Unique identifier. Required even for separators so they can be removed later. |
-| `options.parent_id` | `string` | — | ID of a submenu to place the separator inside. |
-
-```javascript
-await tray.add('open', 'Open');
-await tray.addSeparator('sep-1');
-await tray.add('quit', 'Quit');
-```
-
----
-
-### Menu Mutation
-
-Items can be modified at any time after creation. Changes are reflected immediately in the live menu.
-
----
-
-#### `tray.rename(id, title) → Promise<void>`
-
-Changes the visible label of any item, check item, or submenu.
-
-```javascript
-await tray.rename('sync', 'Syncing...');
-// later
-await tray.rename('sync', 'Sync Complete ✓');
-```
-
-> Calling `rename` on a separator rejects — separators have no title.
-
----
-
-#### `tray.setEnabled(id, enabled) → Promise<void>`
-
-Enables or disables an item. Disabled items are visible but greyed out and not clickable.
-
-```javascript
-await tray.setEnabled('export', false); // grey out
-await tray.setEnabled('export', true);  // restore
-```
-
-> Works on regular items, check items, and submenus (disabling a submenu makes it inaccessible).
-
----
-
-#### `tray.setChecked(id, checked) → Promise<void>`
-
-Programmatically sets the checked state of a check item without triggering a `"check"` event.
-
-```javascript
-// Sync visual state to app state without a user interaction
-await tray.setChecked('dark-mode', app.isDarkMode());
-```
-
-> Rejects if `id` refers to a non-check item.
-
----
-
-#### `tray.toggle(id) → Promise<void>`
-
-Flips the checked state of a check item. Equivalent to `setChecked(id, !current)`.
-
-```javascript
-await tray.toggle('mute');
-```
-
-> Rejects if `id` refers to a non-check item.
-
----
-
-#### `tray.remove(id) → Promise<void>`
-
-Removes an item from the menu entirely and frees its ID for reuse.
-
-```javascript
-await tray.remove('sep-1');
-await tray.remove('old-item');
-```
-
-**Constraints:**
-- Removing a submenu that still has children rejects with an error. Remove all children first, or use `tray.clear()`.
-- After removal, the ID is free and can be registered again with a new add call.
-
-```javascript
-// Correct teardown order for a submenu
-await tray.remove('sub-child-1');
-await tray.remove('sub-child-2');
-await tray.remove('my-submenu'); // now safe
-```
-
----
-
-#### `tray.clear() → Promise<void>`
-
-Removes all items from the menu at once. Resets the menu to empty.
-
-```javascript
-await tray.clear();
-// Menu is now empty — rebuild from scratch
-await tray.add('quit', 'Quit');
-```
-
-> Useful for dynamically rebuilding a context menu in response to app state changes.
+Low-level escape hatch. All higher-level methods call this internally. Commands time out after **10 seconds**.
 
 ---
 
@@ -344,7 +156,7 @@ await tray.add('quit', 'Quit');
 
 #### `tray.setIcon(iconPath) → Promise<void>`
 
-Sets the tray icon from an image file.
+Sets the tray icon from a local image file. Path is resolved to absolute automatically.
 
 | Format | Windows | macOS | Linux |
 |--------|---------|-------|-------|
@@ -354,23 +166,28 @@ Sets the tray icon from an image file.
 
 ```javascript
 await tray.setIcon('./icons/tray.png');
-await tray.setIcon('./icons/tray-active.png'); // swap dynamically
 ```
 
-**Recommendations:**
-- Use **PNG** for best cross-platform results
-- Provide a **template image** (black + transparent) on macOS for automatic dark/light mode support
-- Recommended sizes: `16×16`, `32×32`, or `22×22` (Linux)
-- Path is resolved to absolute automatically
+---
+
+#### `tray.setIconData(base64) → Promise<void>`
+
+Sets the tray icon from a base64-encoded PNG string. A `data:image/...;base64,` prefix is stripped automatically. For static dynamically-generated icons only — not suitable for animation.
+
+```javascript
+const png = generateIconAsBase64();
+await tray.setIconData(png);
+// or with data URL prefix:
+await tray.setIconData('data:image/png;base64,...');
+```
 
 ---
 
 #### `tray.setTooltip(title) → Promise<void>`
 
-Sets the tooltip shown when the user hovers over the tray icon.
+Sets the tooltip shown on hover.
 
 ```javascript
-await tray.setTooltip('My App — Connected');
 await tray.setTooltip('My App — 3 notifications');
 ```
 
@@ -378,180 +195,349 @@ await tray.setTooltip('My App — 3 notifications');
 
 #### `tray.setTrayTitle(title) → Promise<void>`
 
-**macOS only.** Sets text rendered directly in the menu bar beside the icon.
+**macOS only.** Sets text beside the tray icon in the menu bar. Rejects on Windows and Linux.
 
 ```javascript
-await tray.setTrayTitle('●'); // status dot
-await tray.setTrayTitle('3'); // notification count
-await tray.setTrayTitle('');  // clear it
+if (process.platform === 'darwin') await tray.setTrayTitle('●');
 ```
 
-> On Windows and Linux this rejects via a daemon error. Wrap in try/catch or guard with a platform check if your code runs cross-platform:
-> ```javascript
-> if (process.platform === 'darwin') await tray.setTrayTitle('●');
-> ```
-
 ---
 
-### Lifecycle
+### Named Icon States
 
----
+Pre-load multiple icons by name so switching between them is instantaneous with no disk I/O at switch time. All decoding happens eagerly when `defineStates()` is called.
 
-#### `tray.quit() → Promise<void>`
-
-Sends a graceful shutdown command to the daemon. The daemon removes the tray icon from the OS, then exits cleanly.
+#### `tray.defineStates(states) → Promise<void>`
 
 ```javascript
-tray.on('click', async (id) => {
-  if (id === 'quit') {
-    await tray.quit();
-    process.exit(0);
-  }
+await tray.defineStates({
+  idle:       './icons/idle.png',
+  active:     './icons/active.png',
+  error:      './icons/error.png',
 });
 ```
 
-> After `quit()` resolves, the daemon process is gone. The `"exit"` event fires shortly after. Do not call any further tray methods after this.
+#### `tray.setState(stateName) → Promise<void>`
+
+```javascript
+await tray.setState('active');
+// later...
+await tray.setState('error');
+```
+
+---
+
+### Menu Creation
+
+All IDs must be unique. Registering the same ID twice rejects with an error.
+
+> **Note:** Once `setMenu()` has been called, `add`, `addCheck`, `addSubmenu`, `addSeparator`, and `remove` are forbidden and will reject. Update your template and call `setMenu()` again. `rename`, `setEnabled`, `setChecked`, and `toggle` remain permitted after `setMenu()`.
+
+---
+
+#### `tray.add(id, title, options?) → Promise<void>`
+
+Adds a regular clickable menu item.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `id` | `string` | — | Unique identifier |
+| `title` | `string` | — | Label shown in menu |
+| `options.enabled` | `boolean` | `true` | Whether item is clickable |
+| `options.parent_id` | `string` | — | ID of a submenu to nest inside |
+
+```javascript
+await tray.add('open',  'Open Window');
+await tray.add('about', 'About', { enabled: false });
+await tray.add('sub-item', 'Sub Item', { parent_id: 'my-submenu' });
+```
+
+---
+
+#### `tray.addCheck(id, title, options?) → Promise<void>`
+
+Adds a checkable menu item. Emits `"check"` events (not `"click"`).
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `id` | `string` | — | Unique identifier |
+| `title` | `string` | — | Label shown in menu |
+| `options.checked` | `boolean` | `false` | Initial checked state |
+| `options.enabled` | `boolean` | `true` | Whether item is clickable |
+| `options.parent_id` | `string` | — | ID of a submenu to nest inside |
+
+```javascript
+await tray.addCheck('dark-mode', 'Dark Mode', { checked: true });
+```
+
+---
+
+#### `tray.addSubmenu(id, title, options?) → Promise<void>`
+
+Adds a submenu that expands on hover. Maximum nesting depth: 5 levels.
+
+```javascript
+await tray.addSubmenu('settings', 'Settings');
+await tray.add('theme',    'Change Theme',    { parent_id: 'settings' });
+await tray.add('language', 'Change Language', { parent_id: 'settings' });
+```
+
+---
+
+#### `tray.addSeparator(id, options?) → Promise<void>`
+
+Adds a horizontal divider. IDs are required so separators can be removed later.
+
+```javascript
+await tray.add('open', 'Open');
+await tray.addSeparator('sep-1');
+await tray.add('quit', 'Quit');
+```
+
+---
+
+### Declarative Menus
+
+#### `tray.setMenu(template) → Promise<void>`
+
+Replaces the entire menu atomically with no visible flicker. Accepts a typed tree of `MenuItemTemplate` nodes.
+
+```javascript
+await tray.setMenu([
+  { type: 'item',      id: 'open',  title: 'Open' },
+  { type: 'check',     id: 'dark',  title: 'Dark Mode', checked: false },
+  { type: 'separator', id: 'sep-1' },
+  { type: 'submenu',   id: 'more',  title: 'More', items: [
+    { type: 'item', id: 'about', title: 'About' }
+  ]},
+  { type: 'item', id: 'quit', title: 'Quit' }
+]);
+```
+
+**Template node types:**
+
+| `type` | Required fields | Optional fields |
+|--------|----------------|-----------------|
+| `"item"` | `id`, `title` | `enabled`, `icon` |
+| `"check"` | `id`, `title` | `enabled`, `checked` |
+| `"separator"` | `id` | — |
+| `"submenu"` | `id`, `title`, `items` | `enabled` |
+
+To update the menu after calling `setMenu()`, mutate your template and call `setMenu()` again. Property mutations (`rename`, `setEnabled`, `setChecked`, `toggle`) are still allowed without a full rebuild.
+
+---
+
+### Menu Mutation
+
+All mutation methods work regardless of whether the menu was built imperatively or via `setMenu()`.
+
+#### `tray.rename(id, title) → Promise<void>`
+
+```javascript
+await tray.rename('sync', 'Syncing...');
+```
+
+#### `tray.setEnabled(id, enabled) → Promise<void>`
+
+```javascript
+await tray.setEnabled('export', false);
+```
+
+#### `tray.setChecked(id, checked) → Promise<void>`
+
+```javascript
+await tray.setChecked('dark-mode', app.isDarkMode());
+```
+
+#### `tray.toggle(id) → Promise<void>`
+
+```javascript
+await tray.toggle('mute');
+```
+
+#### `tray.remove(id) → Promise<void>`
+
+Remove a submenu's children before removing the submenu itself.
+
+```javascript
+await tray.remove('old-item');
+```
+
+#### `tray.clear() → Promise<void>`
+
+Removes all items. Also clears the `setMenu()` lock so imperative adds are permitted again.
+
+```javascript
+await tray.clear();
+```
+
+---
+
+### Autostart
+
+Register or unregister your app as a system startup entry.
+
+#### `tray.setAutostart(appId, execPath, enabled) → Promise<void>`
+#### `tray.getAutostart(appId) → Promise<boolean>`
+
+| Platform | Mechanism |
+|----------|-----------|
+| **macOS** | LaunchAgent plist at `~/Library/LaunchAgents/<appId>.plist` |
+| **Linux** | `.desktop` file at `~/.config/autostart/<appId>.desktop` |
+| **Windows** | Registry value in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` |
+
+```javascript
+await tray.setAutostart('com.example.myapp', '/usr/bin/node /app/server.js', true);
+
+const enabled = await tray.getAutostart('com.example.myapp');
+console.log('Starts on boot:', enabled);
+
+// Unregister
+await tray.setAutostart('com.example.myapp', '/usr/bin/node /app/server.js', false);
+```
+
+> **macOS note:** `execPath` is split on whitespace into separate `ProgramArguments` entries. Quoted arguments with embedded spaces are respected. Passing a single unsplit string causes launchd to fail silently — tray-hook handles the splitting for you automatically.
 
 ---
 
 ### Events
 
-`Tray` extends Node's `EventEmitter`. Attach listeners with `.on()`, `.once()`, or `.off()`.
-
----
-
 #### `"ready"`
-
-Emitted once when the daemon is up and the tray icon has been registered with the OS. Equivalent to the Promise returned by `start()` resolving.
-
-```javascript
-tray.on('ready', () => console.log('Tray is live'));
-```
-
----
+Emitted once when the daemon is live.
 
 #### `"click"` · `(id: string)`
-
-Emitted when a **regular** menu item is activated.
+Emitted when a regular menu item is activated.
 
 ```javascript
 tray.on('click', (id) => {
-  switch (id) {
-    case 'open':  openMainWindow(); break;
-    case 'quit':  tray.quit();      break;
-  }
+  if (id === 'quit') tray.quit();
 });
 ```
 
-> Check items emit `"check"`, not `"click"`. See below.
-
----
-
 #### `"check"` · `(id: string, checked: boolean)`
-
-Emitted when a **check item** is activated. `checked` is the **new** state after the click.
+Emitted when a check item is activated. `checked` is the new state.
 
 ```javascript
 tray.on('check', (id, checked) => {
   if (id === 'dark-mode') applyTheme(checked ? 'dark' : 'light');
-  if (id === 'autostart') setAutostart(checked);
 });
 ```
 
----
+#### `"tray_click"` · `(button: "left" | "right" | "double")`
+Emitted when the user interacts directly with the tray icon itself (not a menu item).
+
+```javascript
+tray.on('tray_click', (button) => {
+  if (button === 'double') openMainWindow();
+  if (button === 'right')  showContextInfo();
+});
+```
+
+> **macOS caveat:** When a menu is attached to the tray icon, the OS intercepts left-click to open the menu before the event can fire. The `"left"` value is unreliable on macOS. Use `"right"` or `"double"` for cross-platform interactions.
 
 #### `"exit"` · `(code: number | null)`
+Emitted when the daemon process exits.
 
-Emitted when the daemon process exits, whether gracefully (via `quit()`) or unexpectedly. `code` is `null` if the process was killed by a signal.
+#### `"restart"`
+Emitted after the daemon has been automatically restarted and all shadow state has been replayed. The tray icon, menu, tooltip, and icon states are fully restored.
 
 ```javascript
-tray.on('exit', (code) => {
-  if (code !== 0) console.error(`Tray daemon crashed (code ${code})`);
-});
+tray.on('restart', () => console.log('Tray daemon recovered'));
+```
+
+#### `"error"` · `(err: Error)`
+Emitted for unmatched or protocol-level errors.
+
+> **Important:** If no `"error"` listener is attached, Node.js will throw and crash your process. Always attach one.
+
+```javascript
+tray.on('error', (err) => console.error('[tray-hook]', err.message));
 ```
 
 ---
 
-#### `"error"` · `(err: Error)`
+### Auto-Restart & Crash Recovery
 
-Emitted for unmatched or protocol-level errors from the daemon — errors that could not be correlated to a specific command call.
-
-> **Important:** Per Node.js convention, if no `"error"` listener is attached and this event fires, Node will throw and crash your process. Always attach one.
+By default, if the daemon crashes unexpectedly, tray-hook automatically respawns it and replays all tracked state — icon, tooltip, menu structure, check states, named icon states — so the tray reappears without any user intervention.
 
 ```javascript
-tray.on('error', (err) => {
-  console.error('[tray-hook error]', err.message);
-});
+const tray = createTray({ autoRestart: true }); // default
+
+tray.on('restart', () => console.log('Tray recovered after crash'));
+tray.on('error',   (err) => console.error('Tray error:', err.message));
+```
+
+**Circuit-breaker:** If the daemon crashes 5 times within 10 seconds, auto-restart is permanently disabled and a fatal `"error"` event is emitted. This prevents a bad payload from pegging the CPU in an infinite crash loop.
+
+```javascript
+// Disable auto-restart entirely
+const tray = createTray({ autoRestart: false });
+
+// Or disable it later at runtime
+tray.disableAutoRestart();
 ```
 
 ---
 
 ## Patterns & Recipes
 
-### Dynamic Menu (Live Updates)
+### Dynamic Status Icon
 
 ```javascript
-const tray = createTray();
-await tray.start();
-await tray.setIcon('./icon.png');
+await tray.defineStates({
+  idle:       './icons/idle.png',
+  syncing:    './icons/syncing.png',
+  error:      './icons/error.png',
+});
 
-await tray.add('status', 'Status: Connecting...', { enabled: false });
-await tray.addSeparator('sep');
-await tray.add('quit', 'Quit');
+await tray.setState('idle');
 
-// Update label as connection state changes
-app.on('connected',    () => tray.rename('status', 'Status: Connected ✓'));
-app.on('disconnected', () => tray.rename('status', 'Status: Offline'));
+app.on('sync:start', () => tray.setState('syncing'));
+app.on('sync:done',  () => tray.setState('idle'));
+app.on('sync:error', () => tray.setState('error'));
 ```
 
 ---
 
-### Rebuilding the Menu on Demand
+### Declarative Menu with Live Mutations
 
 ```javascript
-async function buildMenu(items) {
-  await tray.clear();
-  for (const item of items) {
-    await tray.add(item.id, item.label);
+await tray.setMenu([
+  { type: 'item',  id: 'status', title: 'Status: Stopped', enabled: false },
+  { type: 'item',  id: 'toggle', title: 'Start Server' },
+  { type: 'separator', id: 'sep' },
+  { type: 'check', id: 'autostart', title: 'Auto-Start on Boot' },
+  { type: 'separator', id: 'sep2' },
+  { type: 'item',  id: 'quit',   title: 'Quit' },
+]);
+
+let running = false;
+
+tray.on('click', async (id) => {
+  if (id === 'toggle') {
+    running = !running;
+    // rename/setEnabled are allowed after setMenu()
+    await tray.rename('status', running ? 'Status: Running ✓' : 'Status: Stopped');
+    await tray.rename('toggle', running ? 'Stop Server' : 'Start Server');
   }
-  await tray.addSeparator('sep');
-  await tray.add('quit', 'Quit');
-}
-
-// Rebuild whenever your data changes
-store.on('change', () => buildMenu(store.getRecentItems()));
+  if (id === 'quit') { await tray.quit(); process.exit(0); }
+});
 ```
 
 ---
 
-### Nested Submenus
+### Tray Icon Interactions
 
 ```javascript
-await tray.addSubmenu('view', 'View');
+tray.on('tray_click', (button) => {
+  if (button === 'double') openMainWindow();
 
-await tray.addSubmenu('zoom', 'Zoom', { parent_id: 'view' });
-await tray.add('zoom-in',  'Zoom In',  { parent_id: 'zoom' });
-await tray.add('zoom-out', 'Zoom Out', { parent_id: 'zoom' });
+  // Right-click: safe to use on all platforms
+  if (button === 'right') showQuickActions();
 
-await tray.addSeparator('view-sep', { parent_id: 'view' });
-await tray.addCheck('fullscreen', 'Full Screen', { parent_id: 'view' });
-```
-
----
-
-### Notification Badge (macOS)
-
-```javascript
-let unread = 0;
-
-function setUnread(n) {
-  unread = n;
-  tray.setTrayTitle(n > 0 ? String(n) : '');
-  tray.setTooltip(n > 0 ? `${n} unread messages` : 'My App');
-}
-
-app.on('message', () => setUnread(unread + 1));
-app.on('opened',  () => setUnread(0));
+  // Left-click: unreliable on macOS when a menu is attached
+  if (button === 'left' && process.platform !== 'darwin') toggleWindow();
+});
 ```
 
 ---
@@ -561,48 +547,13 @@ app.on('opened',  () => setUnread(0));
 ```javascript
 tray.on('click', async (id) => {
   if (id !== 'quit') return;
-  await tray.quit();   // remove icon from OS tray
-  process.exit(0);
-});
-
-// Also handle OS-level signals
-process.on('SIGTERM', async () => {
   await tray.quit();
   process.exit(0);
 });
 
-// If the daemon crashes unexpectedly, don't hang
-tray.on('exit', (code) => {
-  if (code !== 0) process.exit(1);
-});
-```
+process.on('SIGTERM', async () => { await tray.quit(); process.exit(0); });
 
----
-
-### Error Handling (Production)
-
-```javascript
-const tray = createTray();
-
-tray.on('error', (err) => {
-  logger.error('tray-hook:', err.message);
-});
-
-try {
-  await tray.start();
-} catch (err) {
-  // Binary not found, permission denied, unsupported platform, etc.
-  console.error('Failed to start tray:', err.message);
-  process.exit(1);
-}
-
-// Individual command errors
-try {
-  await tray.add('item', 'My Item');
-} catch (err) {
-  // e.g. "id 'item' already exists", validation errors, timeout
-  console.warn('Could not add menu item:', err.message);
-}
+tray.on('exit', (code) => { if (code !== 0) process.exit(1); });
 ```
 
 ---
@@ -615,7 +566,7 @@ try {
 tray-hook: could not find native binary. Is '@phtdacosta/tray-hook-darwin-arm64' installed?
 ```
 
-**Fix:** The platform-specific package wasn't installed. This usually means npm skipped it because `os`/`cpu` fields didn't match, or you're running under Rosetta.
+**Fix:** The platform package wasn't installed. Force-install it:
 
 ```bash
 npm install @phtdacosta/tray-hook-darwin-arm64 --ignore-platform
@@ -625,31 +576,47 @@ npm install @phtdacosta/tray-hook-darwin-arm64 --ignore-platform
 
 ### Tray Icon Doesn't Appear (Linux)
 
-No error is thrown, but the icon is invisible.
+No error is thrown but the icon is invisible.
 
-**Fix:** Your desktop environment doesn't have a system tray host. Install the AppIndicator extension for GNOME:
+**Fix:** Install the AppIndicator extension for GNOME:
 
 ```bash
-# Ubuntu/Debian
 sudo apt install gnome-shell-extension-appindicator
-# then enable in GNOME Extensions
 ```
 
 ---
 
-### `setTrayTitle` Throws on Windows/Linux
+### `setTrayTitle` Rejects on Windows/Linux
 
 ```
 Error: [daemon] set_tray_title is only supported on macOS
 ```
 
-**Expected.** This feature is macOS-only. Guard with a platform check:
+Expected. Guard with a platform check:
 
 ```javascript
-if (process.platform === 'darwin') {
-  await tray.setTrayTitle('●');
-}
+if (process.platform === 'darwin') await tray.setTrayTitle('●');
 ```
+
+---
+
+### Imperative Add Rejects After `setMenu()`
+
+```
+Error: tray-hook: cannot mutate menu structure imperatively after setMenu()
+```
+
+**Fix:** Update your template array and call `setMenu()` again. `rename`, `setEnabled`, `setChecked`, and `toggle` are still allowed.
+
+---
+
+### Fatal Crash Loop Error
+
+```
+Error: tray-hook: daemon crashed 5 times within 10000ms — auto-restart disabled
+```
+
+The daemon crashed repeatedly with the same payload. Check your icon paths, menu templates, and command arguments for invalid values. After fixing, call `tray.start()` manually to restart.
 
 ---
 
@@ -659,7 +626,7 @@ if (process.platform === 'darwin') {
 Error: tray-hook: command 'add' (cmd_id=3) timed out after 10000ms
 ```
 
-The daemon didn't respond within 10 seconds. This usually means it crashed or was killed externally. Check the `"exit"` event and restart with `tray.start()`.
+The daemon didn't respond within 10 seconds — likely crashed or was killed externally. Check the `"exit"` event; auto-restart will handle recovery if enabled.
 
 ---
 
@@ -669,30 +636,20 @@ The daemon didn't respond within 10 seconds. This usually means it crashed or wa
 Error: 'my-submenu' still has children — remove them first
 ```
 
-**Fix:** Remove all child items before removing their parent submenu. Or use `tray.clear()` to wipe everything at once.
-
----
-
-### Multiple `start()` Calls
-
-```javascript
-await tray.start();
-await tray.start(); // ← returns the same resolved Promise — safe, does nothing
-```
-
-`start()` is idempotent by design. The second call resolves immediately.
+**Fix:** Remove all child items before the parent, or use `tray.clear()`.
 
 ---
 
 ## Constraints & Limits
 
-| Constraint | Value | Reason |
-|-----------|-------|--------|
-| Max ID length | 128 chars | Prevents unbounded memory use in the daemon |
-| Max title length | 256 chars | OS menu label limits |
-| Max nesting depth | 5 levels | Platform consistency (Windows is the limiting factor) |
-| Command timeout | 10 seconds | Prevents hanging Promises on daemon crash |
-| ID characters | No control chars (`\x00–\x1f`) | JSON safety |
+| Constraint | Value |
+|-----------|-------|
+| Max ID length | 128 chars |
+| Max title length | 256 chars |
+| Max nesting depth | 5 levels |
+| Command timeout | 10 seconds |
+| Auto-restart max crashes | 5 per 10 seconds |
+| ID characters | No control chars (`\x00–\x1f`) |
 
 ---
 

@@ -1,6 +1,6 @@
 {
   "name": "@phtdacosta/tray-hook-darwin-x64",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "tray-hook native binary for macOS x64",
   "license": "MIT",
   "repository": {

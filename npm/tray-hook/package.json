@@ -1,6 +1,6 @@
 {
   "name": "tray-hook",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Cross-platform native system tray for Bun and Node.js",
   "type": "module",
   "main": "index.js",
@@ -14,7 +14,8 @@
   "files": [
     "index.js",
     "index.d.ts",
-    "examples/"
+    "examples/",
+    "README.md"
   ],
   "engines": {
     "node": ">=18.0.0",
@@ -40,11 +41,11 @@
   },
   "homepage": "https://github.com/phtdacosta/tray-hook#readme",
   "optionalDependencies": {
-    "@phtdacosta/tray-hook-win32-x64":    "1.0.0",
-    "@phtdacosta/tray-hook-win32-arm64":  "1.0.0",
-    "@phtdacosta/tray-hook-darwin-x64":   "1.0.0",
-    "@phtdacosta/tray-hook-darwin-arm64": "1.0.0",
-    "@phtdacosta/tray-hook-linux-x64":    "1.0.0",
-    "@phtdacosta/tray-hook-linux-arm64":  "1.0.0"
+    "@phtdacosta/tray-hook-win32-x64":    "1.1.0",
+    "@phtdacosta/tray-hook-win32-arm64":  "1.1.0",
+    "@phtdacosta/tray-hook-darwin-x64":   "1.1.0",
+    "@phtdacosta/tray-hook-darwin-arm64": "1.1.0",
+    "@phtdacosta/tray-hook-linux-x64":    "1.1.0",
+    "@phtdacosta/tray-hook-linux-arm64":  "1.1.0"
   }
 }

@@ -1,30 +1,7 @@
-//! tray-hook — rock-solid, cross-platform system tray daemon
-//! driven entirely by JSON over stdin/stdout.
-//!
-//! ── Inbound (stdin → tray-hook) ───────────────────────────────────────────
-//!   { "cmd_id":"c1", "action":"add",         "id":"quit", "title":"Quit" }
-//!   { "cmd_id":"c2", "action":"add_check",   "id":"dark", "title":"Dark mode", "checked":false }
-//!   { "cmd_id":"c3", "action":"add_submenu", "id":"sub",  "title":"More" }
-//!   { "cmd_id":"c4", "action":"add",         "id":"s1",   "title":"Sub-item", "parent_id":"sub" }
-//!   { "cmd_id":"c5", "action":"add_separator","id":"sep1" }
-//!   { "cmd_id":"c6", "action":"rename",      "id":"quit", "title":"Exit" }
-//!   { "cmd_id":"c7", "action":"set_enabled",  "id":"quit", "enabled":false }
-//!   { "cmd_id":"c8", "action":"toggle",       "id":"dark" }
-//!   { "cmd_id":"c9", "action":"set_checked",  "id":"dark", "checked":true }
-//!   { "cmd_id":"c0", "action":"remove",       "id":"sep1" }
-//!   {               "action":"clear" }
-//!   {               "action":"set_icon",      "path":"/abs/path/icon.png" }
-//!   {               "action":"set_tooltip",   "title":"My App" }
-//!   {               "action":"set_tray_title","title":"●" }   ← macOS only
-//!   {               "action":"quit" }
-//!
-//! ── Outbound (tray-hook → stdout) ─────────────────────────────────────────
-//!   { "event":"ready" }
-//!   { "event":"click", "id":"quit" }
-//!   { "event":"check", "id":"dark", "checked":true }
-//!   { "event":"ack",   "cmd_id":"c1" }
-//!   { "event":"error", "cmd_id":"c2", "message":"id 'dark' already exists" }
+//! tray-hook — cross-platform system tray daemon driven by JSON over stdin/stdout.
 
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use muda::{CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -33,7 +10,7 @@ use std::path::Path;
 use std::thread;
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
-use tray_icon::{Icon, TrayIconBuilder};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -41,47 +18,129 @@ const MAX_ID_LEN: usize = 128;
 const MAX_TITLE_LEN: usize = 256;
 const MAX_DEPTH: usize = 5;
 
-// ─── Protocol ─────────────────────────────────────────────────────────────────
+// ─── Wire Types (stdin) ───────────────────────────────────────────────────────
 
-/// Every message arriving from the host process.
+/// Raw inbound command before any preprocessing.
 #[derive(Deserialize, Debug)]
 struct BunCommand {
-    /// Caller-supplied correlation token; echoed verbatim in ack/error.
-    cmd_id: Option<String>,
-    action: String,
-    id: Option<String>,
-    title: Option<String>,
-    path: Option<String>,
-    enabled: Option<bool>,
-    checked: Option<bool>,
-    parent_id: Option<String>,
+    cmd_id:     Option<String>,
+    action:     String,
+    id:         Option<String>,
+    title:      Option<String>,
+    path:       Option<String>,                   // set_icon: file path
+    icon:       Option<String>,                   // add / add_check: item icon path
+    data:       Option<String>,                   // set_icon_data: base64 PNG
+    enabled:    Option<bool>,
+    checked:    Option<bool>,
+    parent_id:  Option<String>,
+    items:      Option<Vec<RawMenuItem>>,         // set_menu template
+    states:     Option<HashMap<String, String>>,  // define_states: name → path
+    state_name: Option<String>,                   // set_state
+    app_id:     Option<String>,                   // autostart
+    exec_path:  Option<String>,                   // autostart
 }
 
-/// Every message we push back to the host process.
+/// Raw menu item node from the set_menu template (before icon decoding).
+#[derive(Deserialize, Debug)]
+struct RawMenuItem {
+    #[serde(rename = "type")]
+    item_type: String,
+    id:        String,
+    title:     Option<String>,
+    enabled:   Option<bool>,
+    checked:   Option<bool>,
+    icon:      Option<String>,
+    items:     Option<Vec<RawMenuItem>>,
+}
+
+// ─── Preprocessed Types (cross-thread) ───────────────────────────────────────
+
+/// Send-safe icon data. tray_icon::Icon holds a platform handle (HICON on
+/// Windows) and is therefore !Send. We pass raw RGBA bytes through the
+/// EventLoopProxy and reconstruct Icon on the GUI thread just before use.
+type RgbaBytes = (Vec<u8>, u32, u32);
+
+/// Menu item node with all icons already decoded to RgbaBytes.
+#[derive(Debug)]
+struct ProcessedMenuItem {
+    item_type: String,
+    id:        String,
+    title:     Option<String>,
+    enabled:   bool,
+    checked:   bool,
+    icon:      Option<RgbaBytes>,
+    items:     Vec<ProcessedMenuItem>,
+}
+
+/// Fully preprocessed command — all I/O and decoding done on the stdin thread.
+/// Every variant is Send because it contains only Vec<u8>, String, bool, etc.
+#[derive(Debug)]
+enum ProcessedCommand {
+    // Tray level
+    SetIcon(RgbaBytes),
+    SetIconData(RgbaBytes),
+    SetTooltip(String),
+    SetTrayTitle(String),
+    // Menu creation
+    Add { id: String, title: String, enabled: bool, parent_id: Option<String>, icon: Option<RgbaBytes> },
+    AddCheck { id: String, title: String, enabled: bool, checked: bool, parent_id: Option<String>, icon: Option<RgbaBytes> },
+    AddSubmenu { id: String, title: String, enabled: bool, parent_id: Option<String> },
+    AddSeparator { id: String, parent_id: Option<String> },
+    SetMenu(Vec<ProcessedMenuItem>),
+    // Mutation
+    Rename { id: String, title: String },
+    SetEnabled { id: String, enabled: bool },
+    SetChecked { id: String, checked: bool },
+    Toggle(String),
+    Remove(String),
+    Clear,
+    // Icon states
+    DefineStates(HashMap<String, RgbaBytes>),
+    SetState(String),
+    // Autostart (Windows → daemon; macOS/Linux → pure JS)
+    SetAutostart { app_id: String, exec_path: String, enabled: bool },
+    GetAutostart(String),
+    // Lifecycle
+    Quit,
+}
+
+/// The EventLoop user-event type.
+/// Carries cmd_id separately so ProcessedCommand variants stay clean.
+type UserEvent = (Option<String>, ProcessedCommand);
+
+// ─── Wire Types (stdout) ─────────────────────────────────────────────────────
+
 #[derive(Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 enum TrayEvent {
-    /// A plain menu item was activated.
-    Click { id: String },
-    /// A check-item was activated; carries the *new* state after the click.
-    Check { id: String, checked: bool },
-    /// Command succeeded.
+    Ready,
+    Click    { id: String },
+    Check    { id: String, checked: bool },
+    TrayClick { button: String },
     Ack {
         #[serde(skip_serializing_if = "Option::is_none")]
         cmd_id: Option<String>,
     },
-    /// Command failed; `message` is human-readable.
     Error {
         #[serde(skip_serializing_if = "Option::is_none")]
         cmd_id: Option<String>,
         message: String,
     },
-    /// Emitted once the event loop is running and ready to accept commands.
-    Ready,
+    Autostart {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cmd_id: Option<String>,
+        enabled: bool,
+    },
 }
 
-/// Write a JSON event to stdout. Never panics; a serialisation failure is silently
-/// dropped because there is nowhere meaningful to report it.
+enum Outcome {
+    Ok,
+    Responded, // command emitted its own custom response; suppress Ack
+    Quit,
+}
+
+// ─── Emit ─────────────────────────────────────────────────────────────────────
+
 fn emit(ev: &TrayEvent) {
     if let Ok(json) = serde_json::to_string(ev) {
         println!("{}", json);
@@ -108,18 +167,13 @@ fn validate_title(title: &str) -> Result<(), String> {
     Ok(())
 }
 
-// ─── Icon Loading ─────────────────────────────────────────────────────────────
+// ─── Icon helpers ─────────────────────────────────────────────────────────────
 
-fn load_icon(path: &Path) -> Result<Icon, String> {
+fn load_icon_bytes(path: &Path) -> Result<RgbaBytes, String> {
     if !path.exists() {
         return Err(format!("icon path does not exist: '{}'", path.display()));
     }
-    match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_lowercase())
-        .as_deref()
-    {
+    match path.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()).as_deref() {
         Some("png" | "ico" | "jpg" | "jpeg") => {}
         other => return Err(format!("unsupported icon format: {:?}", other)),
     }
@@ -127,7 +181,156 @@ fn load_icon(path: &Path) -> Result<Icon, String> {
         .map_err(|e| format!("could not open '{}': {}", path.display(), e))?
         .into_rgba8();
     let (w, h) = img.dimensions();
-    Icon::from_rgba(img.into_raw(), w, h).map_err(|e| format!("invalid icon data: {}", e))
+    Ok((img.into_raw(), w, h))
+}
+
+fn decode_base64_bytes(data: &str) -> Result<RgbaBytes, String> {
+    let bytes = B64.decode(data)
+        .map_err(|e| format!("base64 decode error: {}", e))?;
+    let img = image::load_from_memory(&bytes)
+        .map_err(|e| format!("image decode error: {}", e))?
+        .into_rgba8();
+    let (w, h) = img.dimensions();
+    Ok((img.into_raw(), w, h))
+}
+
+/// Reconstruct an Icon from RgbaBytes on the GUI thread.
+fn bytes_to_icon((rgba, w, h): RgbaBytes) -> Result<Icon, String> {
+    Icon::from_rgba(rgba, w, h).map_err(|e| e.to_string())
+}
+
+// ─── Preprocessing (stdin thread) ────────────────────────────────────────────
+
+fn process_raw_menu_item(raw: RawMenuItem) -> Result<ProcessedMenuItem, String> {
+    let icon = raw.icon.as_deref()
+        .map(|p| load_icon_bytes(Path::new(p)))
+        .transpose()?;
+    let mut children = Vec::new();
+    for child in raw.items.unwrap_or_default() {
+        children.push(process_raw_menu_item(child)?);
+    }
+    Ok(ProcessedMenuItem {
+        item_type: raw.item_type,
+        id:        raw.id,
+        title:     raw.title,
+        enabled:   raw.enabled.unwrap_or(true),
+        checked:   raw.checked.unwrap_or(false),
+        icon,
+        items: children,
+    })
+}
+
+/// Convert a raw BunCommand into a ProcessedCommand, performing all I/O and
+/// decoding here on the stdin thread so the GUI thread stays free of blocking.
+fn preprocess(cmd: BunCommand) -> Result<ProcessedCommand, String> {
+    match cmd.action.as_str() {
+        "set_icon" => {
+            let p = cmd.path.ok_or("missing 'path'")?;
+            Ok(ProcessedCommand::SetIcon(load_icon_bytes(Path::new(&p))?))
+        }
+        "set_icon_data" => {
+            let data = cmd.data.ok_or("missing 'data'")?;
+            Ok(ProcessedCommand::SetIconData(decode_base64_bytes(&data)?))
+        }
+        "set_tooltip" => {
+            let t = cmd.title.ok_or("missing 'title'")?;
+            validate_title(&t)?;
+            Ok(ProcessedCommand::SetTooltip(t))
+        }
+        "set_tray_title" => {
+            let t = cmd.title.ok_or("missing 'title'")?;
+            validate_title(&t)?;
+            Ok(ProcessedCommand::SetTrayTitle(t))
+        }
+        "add" => {
+            let id    = cmd.id.ok_or("missing 'id'")?;
+            let title = cmd.title.ok_or("missing 'title'")?;
+            validate_id(&id)?;
+            validate_title(&title)?;
+            let icon = cmd.icon.as_deref().map(|p| load_icon_bytes(Path::new(p))).transpose()?;
+            Ok(ProcessedCommand::Add {
+                id, title,
+                enabled:   cmd.enabled.unwrap_or(true),
+                parent_id: cmd.parent_id,
+                icon,
+            })
+        }
+        "add_check" => {
+            let id    = cmd.id.ok_or("missing 'id'")?;
+            let title = cmd.title.ok_or("missing 'title'")?;
+            validate_id(&id)?;
+            validate_title(&title)?;
+            let icon = cmd.icon.as_deref().map(|p| load_icon_bytes(Path::new(p))).transpose()?;
+            Ok(ProcessedCommand::AddCheck {
+                id, title,
+                enabled:   cmd.enabled.unwrap_or(true),
+                checked:   cmd.checked.unwrap_or(false),
+                parent_id: cmd.parent_id,
+                icon,
+            })
+        }
+        "add_submenu" => {
+            let id    = cmd.id.ok_or("missing 'id'")?;
+            let title = cmd.title.ok_or("missing 'title'")?;
+            validate_id(&id)?;
+            validate_title(&title)?;
+            Ok(ProcessedCommand::AddSubmenu {
+                id, title,
+                enabled:   cmd.enabled.unwrap_or(true),
+                parent_id: cmd.parent_id,
+            })
+        }
+        "add_separator" => {
+            let id = cmd.id.ok_or("missing 'id'")?;
+            validate_id(&id)?;
+            Ok(ProcessedCommand::AddSeparator { id, parent_id: cmd.parent_id })
+        }
+        "set_menu" => {
+            let raw_items = cmd.items.ok_or("missing 'items'")?;
+            let mut processed = Vec::new();
+            for item in raw_items {
+                processed.push(process_raw_menu_item(item)?);
+            }
+            Ok(ProcessedCommand::SetMenu(processed))
+        }
+        "rename" => {
+            let id    = cmd.id.ok_or("missing 'id'")?;
+            let title = cmd.title.ok_or("missing 'title'")?;
+            validate_title(&title)?;
+            Ok(ProcessedCommand::Rename { id, title })
+        }
+        "set_enabled" => {
+            let id      = cmd.id.ok_or("missing 'id'")?;
+            let enabled = cmd.enabled.ok_or("missing 'enabled'")?;
+            Ok(ProcessedCommand::SetEnabled { id, enabled })
+        }
+        "set_checked" => {
+            let id      = cmd.id.ok_or("missing 'id'")?;
+            let checked = cmd.checked.ok_or("missing 'checked'")?;
+            Ok(ProcessedCommand::SetChecked { id, checked })
+        }
+        "toggle"  => Ok(ProcessedCommand::Toggle(cmd.id.ok_or("missing 'id'")?)),
+        "remove"  => Ok(ProcessedCommand::Remove(cmd.id.ok_or("missing 'id'")?)),
+        "clear"   => Ok(ProcessedCommand::Clear),
+        "define_states" => {
+            let map = cmd.states.ok_or("missing 'states'")?;
+            let mut decoded = HashMap::new();
+            for (name, path_str) in map {
+                decoded.insert(name, load_icon_bytes(Path::new(&path_str))?);
+            }
+            Ok(ProcessedCommand::DefineStates(decoded))
+        }
+        "set_state"    => Ok(ProcessedCommand::SetState(cmd.state_name.ok_or("missing 'state_name'")?)),
+        "set_autostart" => {
+            let app_id    = cmd.app_id.ok_or("missing 'app_id'")?;
+            let exec_path = cmd.exec_path.ok_or("missing 'exec_path'")?;
+            let enabled   = cmd.enabled.ok_or("missing 'enabled'")?;
+            Ok(ProcessedCommand::SetAutostart { app_id, exec_path, enabled })
+        }
+        "get_autostart" => Ok(ProcessedCommand::GetAutostart(cmd.app_id.ok_or("missing 'app_id'")?)),
+        "quit"          => Ok(ProcessedCommand::Quit),
+        other           => Err(format!("unknown action '{}'", other)),
+    }
 }
 
 // ─── Menu Registry ────────────────────────────────────────────────────────────
@@ -142,150 +345,98 @@ enum MenuItemKind {
 impl MenuItemKind {
     fn as_item(&self) -> &dyn IsMenuItem {
         match self {
-            Self::Regular(i) => i,
-            Self::Check(i) => i,
-            Self::Submenu(i) => i,
+            Self::Regular(i)   => i,
+            Self::Check(i)     => i,
+            Self::Submenu(i)   => i,
             Self::Separator(i) => i,
         }
     }
 }
 
 struct MenuEntry {
-    kind: MenuItemKind,
+    kind:      MenuItemKind,
     parent_id: Option<String>,
-    depth: usize,
+    depth:     usize,
 }
 
-/// Single source of truth for all runtime menu state.
-///
-/// ## Borrow-safety design note
-///
-/// `submenus` mirrors every `MenuItemKind::Submenu` that is also stored in
-/// `entries`.  Keeping them in a *separate field* means we can simultaneously
-/// hold an immutable borrow of `entries[id].kind` (to get the `&dyn
-/// IsMenuItem` needed for muda's remove call) and an immutable borrow of
-/// `submenus[parent_id]` (to call `Submenu::remove`), which would otherwise
-/// be a double-borrow on the same `HashMap`.
 struct MenuRegistry {
-    entries: HashMap<String, MenuEntry>,
+    entries:  HashMap<String, MenuEntry>,
     submenus: HashMap<String, Submenu>,
-    root: Menu,
+    root:     Menu,
 }
 
 impl MenuRegistry {
     fn new(root: Menu) -> Self {
-        Self {
-            entries: HashMap::new(),
-            submenus: HashMap::new(),
-            root,
-        }
+        Self { entries: HashMap::new(), submenus: HashMap::new(), root }
     }
 
-    // ── guard helpers ─────────────────────────────────────────────────────
-
     fn guard_dup(&self, id: &str) -> Result<(), String> {
-        if self.entries.contains_key(id) {
-            Err(format!("id '{}' already exists", id))
-        } else {
-            Ok(())
-        }
+        if self.entries.contains_key(id) { Err(format!("id '{}' already exists", id)) }
+        else { Ok(()) }
     }
 
     fn guard_depth(&self, depth: usize) -> Result<(), String> {
-        if depth > MAX_DEPTH {
-            Err(format!("max nesting depth of {MAX_DEPTH} exceeded"))
-        } else {
-            Ok(())
-        }
+        if depth > MAX_DEPTH { Err(format!("max nesting depth of {MAX_DEPTH} exceeded")) }
+        else { Ok(()) }
     }
 
     fn resolve_depth(&self, parent_id: &Option<String>) -> usize {
-        parent_id
-            .as_ref()
+        parent_id.as_ref()
             .and_then(|pid| self.entries.get(pid))
             .map(|e| e.depth + 1)
             .unwrap_or(0)
     }
 
-    // ── internal muda plumbing ────────────────────────────────────────────
-
     fn append_to(&self, item: &dyn IsMenuItem, parent_id: &Option<String>) -> Result<(), String> {
         match parent_id {
-            Some(pid) => self
-                .submenus
-                .get(pid)
+            Some(pid) => self.submenus.get(pid)
                 .ok_or_else(|| format!("'{}' is not a submenu or does not exist", pid))?
-                .append(item)
-                .map_err(|e| e.to_string()),
+                .append(item).map_err(|e| e.to_string()),
             None => self.root.append(item).map_err(|e| e.to_string()),
         }
     }
 
     fn detach_from(&self, item: &dyn IsMenuItem, parent_id: &Option<String>) -> Result<(), String> {
         match parent_id {
-            Some(pid) => self
-                .submenus
-                .get(pid)
+            Some(pid) => self.submenus.get(pid)
                 .ok_or_else(|| format!("parent submenu '{}' not found", pid))?
-                .remove(item)
-                .map_err(|e| e.to_string()),
+                .remove(item).map_err(|e| e.to_string()),
             None => self.root.remove(item).map_err(|e| e.to_string()),
         }
     }
 
-    // ── add operations ────────────────────────────────────────────────────
-
-    fn add_regular(
-        &mut self,
-        id: String,
-        title: String,
-        enabled: bool,
-        parent_id: Option<String>,
-    ) -> Result<(), String> {
+    fn add_regular(&mut self, id: String, title: String, enabled: bool, parent_id: Option<String>, icon: Option<RgbaBytes>) -> Result<(), String> {
         self.guard_dup(&id)?;
         let depth = self.resolve_depth(&parent_id);
         self.guard_depth(depth)?;
+        let _ = icon; // muda 0.17 does not expose set_icon on MenuItem
         let item = MenuItem::with_id(id.clone(), &title, enabled, None);
         self.append_to(&item, &parent_id)?;
-        self.entries
-            .insert(id, MenuEntry { kind: MenuItemKind::Regular(item), parent_id, depth });
+        self.entries.insert(id, MenuEntry { kind: MenuItemKind::Regular(item), parent_id, depth });
         Ok(())
     }
 
-    fn add_check(
-        &mut self,
-        id: String,
-        title: String,
-        enabled: bool,
-        checked: bool,
-        parent_id: Option<String>,
-    ) -> Result<(), String> {
+    fn add_check(&mut self, id: String, title: String, enabled: bool, checked: bool, parent_id: Option<String>, icon: Option<RgbaBytes>) -> Result<(), String> {
         self.guard_dup(&id)?;
         let depth = self.resolve_depth(&parent_id);
         self.guard_depth(depth)?;
         let item = CheckMenuItem::with_id(id.clone(), &title, enabled, checked, None);
+        // muda 0.17 CheckMenuItem does not expose set_icon; icon field is accepted
+        // in the protocol for forward-compatibility but silently ignored here.
+        let _ = icon;
         self.append_to(&item, &parent_id)?;
-        self.entries
-            .insert(id, MenuEntry { kind: MenuItemKind::Check(item), parent_id, depth });
+        self.entries.insert(id, MenuEntry { kind: MenuItemKind::Check(item), parent_id, depth });
         Ok(())
     }
 
-    fn add_submenu(
-        &mut self,
-        id: String,
-        title: String,
-        enabled: bool,
-        parent_id: Option<String>,
-    ) -> Result<(), String> {
+    fn add_submenu(&mut self, id: String, title: String, enabled: bool, parent_id: Option<String>) -> Result<(), String> {
         self.guard_dup(&id)?;
         let depth = self.resolve_depth(&parent_id);
         self.guard_depth(depth)?;
         let sub = Submenu::with_id(id.clone(), &title, enabled);
         self.append_to(&sub, &parent_id)?;
-        // Arc-backed clone — both copies share the same underlying object.
         self.submenus.insert(id.clone(), sub.clone());
-        self.entries
-            .insert(id, MenuEntry { kind: MenuItemKind::Submenu(sub), parent_id, depth });
+        self.entries.insert(id, MenuEntry { kind: MenuItemKind::Submenu(sub), parent_id, depth });
         Ok(())
     }
 
@@ -294,19 +445,16 @@ impl MenuRegistry {
         let depth = self.resolve_depth(&parent_id);
         let sep = PredefinedMenuItem::separator();
         self.append_to(&sep, &parent_id)?;
-        self.entries
-            .insert(id, MenuEntry { kind: MenuItemKind::Separator(sep), parent_id, depth });
+        self.entries.insert(id, MenuEntry { kind: MenuItemKind::Separator(sep), parent_id, depth });
         Ok(())
     }
-
-    // ── mutation operations ───────────────────────────────────────────────
 
     fn rename(&self, id: &str, title: String) -> Result<(), String> {
         let entry = self.entries.get(id).ok_or_else(|| format!("'{}' not found", id))?;
         match &entry.kind {
-            MenuItemKind::Regular(i) => i.set_text(&title),
-            MenuItemKind::Check(i) => i.set_text(&title),
-            MenuItemKind::Submenu(i) => i.set_text(&title),
+            MenuItemKind::Regular(i)   => i.set_text(&title),
+            MenuItemKind::Check(i)     => i.set_text(&title),
+            MenuItemKind::Submenu(i)   => i.set_text(&title),
             MenuItemKind::Separator(_) => return Err("separators have no title".into()),
         }
         Ok(())
@@ -315,35 +463,21 @@ impl MenuRegistry {
     fn set_enabled(&self, id: &str, enabled: bool) -> Result<(), String> {
         let entry = self.entries.get(id).ok_or_else(|| format!("'{}' not found", id))?;
         match &entry.kind {
-            MenuItemKind::Regular(i) => i.set_enabled(enabled),
-            MenuItemKind::Check(i) => i.set_enabled(enabled),
-            MenuItemKind::Submenu(i) => i.set_enabled(enabled),
+            MenuItemKind::Regular(i)   => i.set_enabled(enabled),
+            MenuItemKind::Check(i)     => i.set_enabled(enabled),
+            MenuItemKind::Submenu(i)   => i.set_enabled(enabled),
             MenuItemKind::Separator(_) => return Err("separators have no enabled state".into()),
         }
         Ok(())
     }
 
     fn set_checked(&self, id: &str, checked: bool) -> Result<(), String> {
-        let entry = self.entries.get(id).ok_or_else(|| format!("'{}' not found", id))?;
-        match &entry.kind {
+        match &self.entries.get(id).ok_or_else(|| format!("'{}' not found", id))?.kind {
             MenuItemKind::Check(i) => { i.set_checked(checked); Ok(()) }
             _ => Err(format!("'{}' is not a check item", id)),
         }
     }
 
-    fn toggle(&self, id: &str) -> Result<bool, String> {
-        let entry = self.entries.get(id).ok_or_else(|| format!("'{}' not found", id))?;
-        match &entry.kind {
-            MenuItemKind::Check(i) => {
-                let next = !i.is_checked();
-                i.set_checked(next);
-                Ok(next)
-            }
-            _ => Err(format!("'{}' is not a check item", id)),
-        }
-    }
-
-    /// Returns the current checked state if `id` is a check item, else None.
     fn check_state(&self, id: &str) -> Option<bool> {
         match &self.entries.get(id)?.kind {
             MenuItemKind::Check(i) => Some(i.is_checked()),
@@ -351,21 +485,22 @@ impl MenuRegistry {
         }
     }
 
-    /// Remove a single item.  Submenus must be emptied first.
+    fn toggle(&self, id: &str) -> Result<bool, String> {
+        match &self.entries.get(id).ok_or_else(|| format!("'{}' not found", id))?.kind {
+            MenuItemKind::Check(i) => { let next = !i.is_checked(); i.set_checked(next); Ok(next) }
+            _ => Err(format!("'{}' is not a check item", id)),
+        }
+    }
+
     fn remove(&mut self, id: &str) -> Result<(), String> {
         if !self.entries.contains_key(id) {
             return Err(format!("'{}' not found", id));
         }
-        // Refuse to leave children orphaned in muda's internal tree.
         if self.entries.values().any(|e| e.parent_id.as_deref() == Some(id)) {
-            return Err(format!(
-                "'{}' still has children — remove them first",
-                id
-            ));
+            return Err(format!("'{}' still has children — remove them first", id));
         }
         let parent_id = self.entries[id].parent_id.clone();
         {
-            // entries[id] → immutable borrow; submenus[parent] is a *different field* → safe.
             let item_ref = self.entries[id].kind.as_item();
             self.detach_from(item_ref, &parent_id)?;
         }
@@ -374,145 +509,210 @@ impl MenuRegistry {
         Ok(())
     }
 
-    /// Wipe every item from the menu and the registry atomically.
     fn clear(&mut self) -> Result<(), String> {
-        // Collect root-level IDs up-front to avoid holding a borrow during removal.
-        let root_ids: Vec<String> = self
-            .entries
-            .iter()
+        let root_ids: Vec<String> = self.entries.iter()
             .filter(|(_, e)| e.parent_id.is_none())
             .map(|(id, _)| id.clone())
             .collect();
-
-        // Removing a root-level submenu also removes all of its descendants
-        // from the OS-side menu, so we only need to touch root items here.
-        // Best-effort — if muda returns an error the registry is still cleared.
         for id in &root_ids {
             let item_ref = self.entries[id].kind.as_item();
             let _ = self.root.remove(item_ref);
         }
-
         self.entries.clear();
         self.submenus.clear();
         Ok(())
     }
 }
 
-// ─── Command Dispatch ─────────────────────────────────────────────────────────
+// ─── set_menu recursive builder ───────────────────────────────────────────────
 
-enum Outcome {
-    Ok,
-    Quit,
+fn build_menu_items(
+    items:            Vec<ProcessedMenuItem>,
+    root:             &Menu,
+    parent_sub:       Option<(&str, &Submenu)>,
+    entries:          &mut HashMap<String, MenuEntry>,
+    submenus:         &mut HashMap<String, Submenu>,
+    depth:            usize,
+) -> Result<(), String> {
+    if depth > MAX_DEPTH {
+        return Err(format!("max nesting depth of {MAX_DEPTH} exceeded"));
+    }
+    let parent_id = parent_sub.map(|(id, _)| id.to_string());
+
+    for item in items {
+        // Append to parent submenu or root
+        // Explicit type annotation required — Rust cannot infer the closure
+        // parameter type when IsMenuItem is a trait object behind a reference.
+        let append = |mi: &(dyn IsMenuItem + 'static)| -> Result<(), String> {
+            if let Some((_, sub)) = parent_sub {
+                sub.append(mi).map_err(|e| e.to_string())
+            } else {
+                root.append(mi).map_err(|e| e.to_string())
+            }
+        };
+
+        match item.item_type.as_str() {
+            "item" => {
+                let title = item.title.unwrap_or_default();
+                let _icon = item.icon; // muda 0.17 does not expose set_icon on MenuItem
+                let mi = MenuItem::with_id(item.id.clone(), &title, item.enabled, None);
+                append(&mi)?;
+                entries.insert(item.id, MenuEntry { kind: MenuItemKind::Regular(mi), parent_id: parent_id.clone(), depth });
+            }
+            "check" => {
+                let title = item.title.unwrap_or_default();
+                let _icon = item.icon; // muda 0.17 does not expose set_icon on CheckMenuItem
+                let ci = CheckMenuItem::with_id(item.id.clone(), &title, item.enabled, item.checked, None);
+                append(&ci)?;
+                entries.insert(item.id, MenuEntry { kind: MenuItemKind::Check(ci), parent_id: parent_id.clone(), depth });
+            }
+            "separator" => {
+                let sep = PredefinedMenuItem::separator();
+                append(&sep)?;
+                entries.insert(item.id, MenuEntry { kind: MenuItemKind::Separator(sep), parent_id: parent_id.clone(), depth });
+            }
+            "submenu" => {
+                let id       = item.id;
+                let title    = item.title.unwrap_or_default();
+                let enabled  = item.enabled;
+                let children = item.items;
+                let sub = Submenu::with_id(id.clone(), &title, enabled);
+                append(&sub)?;
+                submenus.insert(id.clone(), sub.clone());
+                entries.insert(id.clone(), MenuEntry {
+                    kind: MenuItemKind::Submenu(sub.clone()),
+                    parent_id: parent_id.clone(),
+                    depth,
+                });
+                build_menu_items(children, root, Some((&id, &sub)), entries, submenus, depth + 1)?;
+            }
+            other => return Err(format!("unknown menu item type '{}'", other)),
+        }
+    }
+    Ok(())
 }
 
+// ─── Windows autostart ────────────────────────────────────────────────────────
+
+#[cfg(target_os = "windows")]
+fn set_autostart_windows(app_id: &str, exec_path: &str, enabled: bool) -> Result<(), String> {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
+    use winreg::RegKey;
+    let run = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(r"Software\Microsoft\Windows\CurrentVersion\Run", KEY_SET_VALUE)
+        .map_err(|e| format!("registry open error: {}", e))?;
+    if enabled {
+        run.set_value(app_id, &exec_path.to_string())
+            .map_err(|e| format!("registry write error: {}", e))?;
+    } else {
+        let _ = run.delete_value(app_id); // not-found is not an error
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn get_autostart_windows(app_id: &str) -> Result<bool, String> {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_QUERY_VALUE};
+    use winreg::RegKey;
+    match RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(r"Software\Microsoft\Windows\CurrentVersion\Run", KEY_QUERY_VALUE)
+    {
+        Ok(run) => Ok(run.get_value::<String, _>(app_id).is_ok()),
+        Err(_)  => Ok(false),
+    }
+}
+
+// ─── Command Dispatch ─────────────────────────────────────────────────────────
+
 fn process(
-    cmd: BunCommand,
-    reg: &mut MenuRegistry,
-    tray: &mut tray_icon::TrayIcon,
+    cmd_id:     &Option<String>,
+    cmd:        ProcessedCommand,
+    registry:   &mut MenuRegistry,
+    tray:       &mut tray_icon::TrayIcon,
+    states_map: &mut HashMap<String, RgbaBytes>,
 ) -> Result<Outcome, String> {
-    match cmd.action.as_str() {
-        // ── tray-level controls ───────────────────────────────────────────
-        "set_icon" => {
-            let p = cmd.path.ok_or("missing 'path'")?;
-            let icon = load_icon(Path::new(&p))?;
-            tray.set_icon(Some(icon)).map_err(|e| e.to_string())?;
+    match cmd {
+        ProcessedCommand::SetIcon(b) => {
+            tray.set_icon(Some(bytes_to_icon(b)?)).map_err(|e| e.to_string())?;
         }
-        "set_tooltip" => {
-            let t = cmd.title.ok_or("missing 'title'")?;
-            validate_title(&t)?;
+        ProcessedCommand::SetIconData(b) => {
+            tray.set_icon(Some(bytes_to_icon(b)?)).map_err(|e| e.to_string())?;
+        }
+        ProcessedCommand::SetTooltip(t) => {
             tray.set_tooltip(Some(t)).map_err(|e| e.to_string())?;
         }
-        // macOS-only: text shown beside the tray icon in the menu bar.
-        "set_tray_title" => {
+        ProcessedCommand::SetTrayTitle(t) => {
             #[cfg(target_os = "macos")]
-            {
-                let t = cmd.title.ok_or("missing 'title'")?;
-                validate_title(&t)?;
-                tray.set_title(Some(t));
-            }
+            tray.set_title(Some(t));
             #[cfg(not(target_os = "macos"))]
-            {
-                return Err("set_tray_title is only supported on macOS".into());
+            { let _ = t; return Err("set_tray_title is only supported on macOS".into()); }
+        }
+        ProcessedCommand::Add { id, title, enabled, parent_id, icon } => {
+            registry.add_regular(id, title, enabled, parent_id, icon)?;
+        }
+        ProcessedCommand::AddCheck { id, title, enabled, checked, parent_id, icon } => {
+            registry.add_check(id, title, enabled, checked, parent_id, icon)?;
+        }
+        ProcessedCommand::AddSubmenu { id, title, enabled, parent_id } => {
+            registry.add_submenu(id, title, enabled, parent_id)?;
+        }
+        ProcessedCommand::AddSeparator { id, parent_id } => {
+            registry.add_separator(id, parent_id)?;
+        }
+        ProcessedCommand::SetMenu(items) => {
+            let new_root = Menu::new();
+            let mut new_entries  = HashMap::new();
+            let mut new_submenus = HashMap::new();
+            build_menu_items(items, &new_root, None, &mut new_entries, &mut new_submenus, 0)?;
+            // Atomically swap the OS-level menu first, then drop old registry data.
+                            // tray_icon 0.21 set_menu returns () — no Result to propagate.
+                tray.set_menu(Some(Box::new(new_root.clone())));
+            registry.entries  = new_entries;
+            registry.submenus = new_submenus;
+            registry.root     = new_root;
+        }
+        ProcessedCommand::Rename { id, title }     => { registry.rename(&id, title)?; }
+        ProcessedCommand::SetEnabled { id, enabled } => { registry.set_enabled(&id, enabled)?; }
+        ProcessedCommand::SetChecked { id, checked } => { registry.set_checked(&id, checked)?; }
+        ProcessedCommand::Toggle(id) => { registry.toggle(&id)?; }
+        ProcessedCommand::Remove(id) => { registry.remove(&id)?; }
+        ProcessedCommand::Clear      => { registry.clear()?; }
+        ProcessedCommand::DefineStates(states) => {
+            *states_map = states;
+        }
+        ProcessedCommand::SetState(name) => {
+            let bytes = states_map.get(&name).cloned()
+                .ok_or_else(|| format!("state '{}' is not defined — call define_states first", name))?;
+            tray.set_icon(Some(bytes_to_icon(bytes)?)).map_err(|e| e.to_string())?;
+        }
+        ProcessedCommand::SetAutostart { app_id, exec_path, enabled } => {
+            #[cfg(target_os = "windows")]
+            set_autostart_windows(&app_id, &exec_path, enabled)?;
+            #[cfg(not(target_os = "windows"))]
+            return Err("set_autostart should be handled in JS on non-Windows".into());
+        }
+        ProcessedCommand::GetAutostart(app_id) => {
+            #[cfg(target_os = "windows")] {
+                let enabled = get_autostart_windows(&app_id)?;
+                emit(&TrayEvent::Autostart { cmd_id: cmd_id.clone(), enabled });
+                return Ok(Outcome::Responded);
             }
+            #[cfg(not(target_os = "windows"))]
+            return Err("get_autostart should be handled in JS on non-Windows".into());
         }
-
-        // ── item creation ─────────────────────────────────────────────────
-        "add" => {
-            let id = cmd.id.ok_or("missing 'id'")?;
-            let title = cmd.title.ok_or("missing 'title'")?;
-            validate_id(&id)?;
-            validate_title(&title)?;
-            reg.add_regular(id, title, cmd.enabled.unwrap_or(true), cmd.parent_id)?;
-        }
-        "add_check" => {
-            let id = cmd.id.ok_or("missing 'id'")?;
-            let title = cmd.title.ok_or("missing 'title'")?;
-            validate_id(&id)?;
-            validate_title(&title)?;
-            reg.add_check(
-                id,
-                title,
-                cmd.enabled.unwrap_or(true),
-                cmd.checked.unwrap_or(false),
-                cmd.parent_id,
-            )?;
-        }
-        "add_submenu" => {
-            let id = cmd.id.ok_or("missing 'id'")?;
-            let title = cmd.title.ok_or("missing 'title'")?;
-            validate_id(&id)?;
-            validate_title(&title)?;
-            reg.add_submenu(id, title, cmd.enabled.unwrap_or(true), cmd.parent_id)?;
-        }
-        "add_separator" => {
-            let id = cmd.id.ok_or("missing 'id'")?;
-            validate_id(&id)?;
-            reg.add_separator(id, cmd.parent_id)?;
-        }
-
-        // ── item mutation ─────────────────────────────────────────────────
-        "rename" => {
-            let id = cmd.id.ok_or("missing 'id'")?;
-            let title = cmd.title.ok_or("missing 'title'")?;
-            validate_title(&title)?;
-            reg.rename(&id, title)?;
-        }
-        "set_enabled" => {
-            let id = cmd.id.ok_or("missing 'id'")?;
-            let en = cmd.enabled.ok_or("missing 'enabled'")?;
-            reg.set_enabled(&id, en)?;
-        }
-        "set_checked" => {
-            let id = cmd.id.ok_or("missing 'id'")?;
-            let ch = cmd.checked.ok_or("missing 'checked'")?;
-            reg.set_checked(&id, ch)?;
-        }
-        "toggle" => {
-            let id = cmd.id.ok_or("missing 'id'")?;
-            reg.toggle(&id)?;
-        }
-        "remove" => {
-            let id = cmd.id.ok_or("missing 'id'")?;
-            reg.remove(&id)?;
-        }
-        "clear" => reg.clear()?,
-
-        // ── lifecycle ─────────────────────────────────────────────────────
-        "quit" => return Ok(Outcome::Quit),
-
-        other => return Err(format!("unknown action '{}'", other)),
+        ProcessedCommand::Quit => return Ok(Outcome::Quit),
     }
-
     Ok(Outcome::Ok)
 }
 
 // ─── Entry Point ──────────────────────────────────────────────────────────────
 
 fn main() {
-    let event_loop = EventLoopBuilder::<BunCommand>::with_user_event().build();
+    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
-    // Stdin reader — runs on its own thread, completely decoupled from the GUI.
+    // Stdin reader — runs on its own OS thread.
+    // All I/O (icon file reads, base64 decoding) happens here.
     thread::spawn(move || {
         let stdin = io::stdin();
         for line in stdin.lock().lines() {
@@ -520,8 +720,14 @@ fn main() {
                 Ok(raw) if !raw.trim().is_empty() => {
                     match serde_json::from_str::<BunCommand>(&raw) {
                         Ok(cmd) => {
-                            if proxy.send_event(cmd).is_err() {
-                                break; // event loop already exited
+                            let cmd_id = cmd.cmd_id.clone();
+                            match preprocess(cmd) {
+                                Ok(processed) => {
+                                    if proxy.send_event((cmd_id, processed)).is_err() {
+                                        break; // event loop already exited
+                                    }
+                                }
+                                Err(msg) => emit(&TrayEvent::Error { cmd_id, message: msg }),
                             }
                         }
                         Err(e) => emit(&TrayEvent::Error {
@@ -530,25 +736,23 @@ fn main() {
                         }),
                     }
                 }
-                Ok(_) => {}       // blank line — ignore
-                Err(_) => break,  // stdin closed or broken pipe
+                Ok(_)  => {} // blank line
+                Err(_) => break, // stdin closed / broken pipe
             }
         }
-        // stdin EOF → host process is gone, exit cleanly.
-        // The event loop may or may not still be running; calling exit()
-        // here is the safest way to guarantee termination without racing.
         std::process::exit(0);
     });
 
     let root_menu = Menu::new();
-    let mut registry = MenuRegistry::new(root_menu.clone());
+    let mut registry   = MenuRegistry::new(root_menu.clone());
+    let mut states_map: HashMap<String, RgbaBytes> = HashMap::new();
 
     let mut tray = match TrayIconBuilder::new()
         .with_menu(Box::new(root_menu.clone()))
         .with_tooltip("tray-hook")
         .build()
     {
-        Ok(t) => t,
+        Ok(t)  => t,
         Err(e) => {
             emit(&TrayEvent::Error {
                 cmd_id: None,
@@ -559,19 +763,36 @@ fn main() {
     };
 
     let menu_rx = MenuEvent::receiver();
+    let tray_rx = TrayIconEvent::receiver();
 
-    // Tell the host we're live and ready.
     emit(&TrayEvent::Ready);
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
-        // ── 1. Forward click/check events to the host ──────────────────────
-        // Drain the entire channel each frame so no events are dropped under
-        // rapid successive clicks.
+        // ── Direct tray icon interactions ────────────────────────────────
+        while let Ok(ev) = tray_rx.try_recv() {
+            match ev {
+                TrayIconEvent::Click { button, button_state, .. } => {
+                    if button_state == MouseButtonState::Up {
+                        let btn = match button {
+                            MouseButton::Left  => "left",
+                            MouseButton::Right => "right",
+                            _                  => continue,
+                        };
+                        emit(&TrayEvent::TrayClick { button: btn.to_string() });
+                    }
+                }
+                TrayIconEvent::DoubleClick { .. } => {
+                    emit(&TrayEvent::TrayClick { button: "double".to_string() });
+                }
+                _ => {}
+            }
+        }
+
+        // ── Menu item activations ────────────────────────────────────────
         while let Ok(ev) = menu_rx.try_recv() {
             let id = ev.id.0.clone();
-            // Distinguish check items so the host receives rich state data.
             if let Some(checked) = registry.check_state(&id) {
                 emit(&TrayEvent::Check { id, checked });
             } else {
@@ -579,13 +800,13 @@ fn main() {
             }
         }
 
-        // ── 2. Execute inbound commands ────────────────────────────────────
-        if let Event::UserEvent(cmd) = event {
-            let cmd_id = cmd.cmd_id.clone();
-            match process(cmd, &mut registry, &mut tray) {
-                Ok(Outcome::Quit) => *control_flow = ControlFlow::Exit,
-                Ok(Outcome::Ok) => emit(&TrayEvent::Ack { cmd_id }),
-                Err(msg) => emit(&TrayEvent::Error { cmd_id, message: msg }),
+        // ── Inbound commands from host ───────────────────────────────────
+        if let Event::UserEvent((cmd_id, cmd)) = event {
+            match process(&cmd_id, cmd, &mut registry, &mut tray, &mut states_map) {
+                Ok(Outcome::Ok)       => emit(&TrayEvent::Ack { cmd_id }),
+                Ok(Outcome::Responded) => {} // already emitted its own response
+                Ok(Outcome::Quit)     => *control_flow = ControlFlow::Exit,
+                Err(msg)              => emit(&TrayEvent::Error { cmd_id, message: msg }),
             }
         }
     });
