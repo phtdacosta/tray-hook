@@ -105,8 +105,17 @@ enum ProcessedCommand {
 }
 
 /// The EventLoop user-event type.
-/// Carries cmd_id separately so ProcessedCommand variants stay clean.
-type UserEvent = (Option<String>, ProcessedCommand);
+///
+/// Using a proper enum instead of a tuple lets us forward `muda::MenuEvent`
+/// and `tray_icon::TrayIconEvent` through the same proxy so the event loop
+/// wakes up immediately on Windows (which blocks in `WaitMessage` under
+/// `ControlFlow::Wait` — crossbeam channel writes alone do not post a Win32
+/// message and therefore cannot wake the loop).
+enum AppEvent {
+    Command(Option<String>, ProcessedCommand),
+    Menu(muda::MenuEvent),
+    Tray(tray_icon::TrayIconEvent),
+}
 
 // ─── Wire Types (stdout) ─────────────────────────────────────────────────────
 
@@ -708,7 +717,7 @@ fn process(
 // ─── Entry Point ──────────────────────────────────────────────────────────────
 
 fn main() {
-    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    let event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
     // Stdin reader — runs on its own OS thread.
@@ -723,7 +732,7 @@ fn main() {
                             let cmd_id = cmd.cmd_id.clone();
                             match preprocess(cmd) {
                                 Ok(processed) => {
-                                    if proxy.send_event((cmd_id, processed)).is_err() {
+                                    if proxy.send_event(AppEvent::Command(cmd_id, processed)).is_err() {
                                         break; // event loop already exited
                                     }
                                 }
@@ -762,52 +771,86 @@ fn main() {
         }
     };
 
-    let menu_rx = MenuEvent::receiver();
-    let tray_rx = TrayIconEvent::receiver();
+    // ── Channel watcher threads ───────────────────────────────────────────────
+    //
+    // Root cause of the Windows click-event delay bug (#1):
+    //
+    // `ControlFlow::Wait` causes tao's Win32 backend to call `WaitMessage()`,
+    // which blocks until a *Win32 message* arrives in the thread queue.
+    // `muda` and `tray-icon` deliver their events via crossbeam channels whose
+    // writes do NOT post a Win32 message — so the event loop stays asleep even
+    // though click data is already sitting in the channel.  The loop only woke
+    // up when the user moved the mouse (generating `WM_MOUSEMOVE`), which is
+    // exactly the symptom reported on Windows 10.
+    //
+    // Fix: one dedicated thread per channel.  Each thread blocks on `recv()`
+    // and forwards the event through `EventLoopProxy::send_event()`, which
+    // posts a `WM_USER`-style message that immediately wakes `WaitMessage()`.
+    // This keeps CPU usage at zero while idle and fires events with no delay.
+
+    let proxy_menu = event_loop.create_proxy();
+    thread::spawn(move || {
+        let menu_rx = MenuEvent::receiver();
+        while let Ok(ev) = menu_rx.recv() {
+            if proxy_menu.send_event(AppEvent::Menu(ev)).is_err() { break; }
+        }
+    });
+
+    let proxy_tray = event_loop.create_proxy();
+    thread::spawn(move || {
+        let tray_rx = TrayIconEvent::receiver();
+        while let Ok(ev) = tray_rx.recv() {
+            if proxy_tray.send_event(AppEvent::Tray(ev)).is_err() { break; }
+        }
+    });
 
     emit(&TrayEvent::Ready);
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
-        // ── Direct tray icon interactions ────────────────────────────────
-        while let Ok(ev) = tray_rx.try_recv() {
-            match ev {
-                TrayIconEvent::Click { button, button_state, .. } => {
-                    if button_state == MouseButtonState::Up {
-                        let btn = match button {
-                            MouseButton::Left  => "left",
-                            MouseButton::Right => "right",
-                            _                  => continue,
-                        };
-                        emit(&TrayEvent::TrayClick { button: btn.to_string() });
+        match event {
+            // ── Direct tray icon interactions ────────────────────────────
+            Event::UserEvent(AppEvent::Tray(ev)) => {
+                match ev {
+                    TrayIconEvent::Click { button, button_state, .. } => {
+                        if button_state == MouseButtonState::Up {
+                            let btn = match button {
+                                MouseButton::Left  => "left",
+                                MouseButton::Right => "right",
+                                _                  => return,
+                            };
+                            emit(&TrayEvent::TrayClick { button: btn.to_string() });
+                        }
                     }
+                    TrayIconEvent::DoubleClick { .. } => {
+                        emit(&TrayEvent::TrayClick { button: "double".to_string() });
+                    }
+                    _ => {}
                 }
-                TrayIconEvent::DoubleClick { .. } => {
-                    emit(&TrayEvent::TrayClick { button: "double".to_string() });
+            }
+
+            // ── Menu item activations ────────────────────────────────────
+            Event::UserEvent(AppEvent::Menu(ev)) => {
+                let id = ev.id.0.clone();
+                if let Some(checked) = registry.check_state(&id) {
+                    emit(&TrayEvent::Check { id, checked });
+                } else {
+                    emit(&TrayEvent::Click { id });
                 }
-                _ => {}
             }
-        }
 
-        // ── Menu item activations ────────────────────────────────────────
-        while let Ok(ev) = menu_rx.try_recv() {
-            let id = ev.id.0.clone();
-            if let Some(checked) = registry.check_state(&id) {
-                emit(&TrayEvent::Check { id, checked });
-            } else {
-                emit(&TrayEvent::Click { id });
+            // ── Inbound commands from host ───────────────────────────────
+            Event::UserEvent(AppEvent::Command(cmd_id, cmd)) => {
+                match process(&cmd_id, cmd, &mut registry, &mut tray, &mut states_map) {
+                    Ok(Outcome::Ok)        => emit(&TrayEvent::Ack { cmd_id }),
+                    Ok(Outcome::Responded) => {} // already emitted its own response
+                    Ok(Outcome::Quit)      => *control_flow = ControlFlow::Exit,
+                    Err(msg)               => emit(&TrayEvent::Error { cmd_id, message: msg }),
+                }
             }
-        }
 
-        // ── Inbound commands from host ───────────────────────────────────
-        if let Event::UserEvent((cmd_id, cmd)) = event {
-            match process(&cmd_id, cmd, &mut registry, &mut tray, &mut states_map) {
-                Ok(Outcome::Ok)       => emit(&TrayEvent::Ack { cmd_id }),
-                Ok(Outcome::Responded) => {} // already emitted its own response
-                Ok(Outcome::Quit)     => *control_flow = ControlFlow::Exit,
-                Err(msg)              => emit(&TrayEvent::Error { cmd_id, message: msg }),
-            }
+            _ => {}
         }
     });
 }
